@@ -1,54 +1,56 @@
-const axios = require('axios');
+const axios  = require('axios');
 const Docker = require('dockerode');
 const config = require('../config.json');
 const CatLoggr = require('cat-loggr');
-const { createVolumesFolder } = require('./init.js')
-const log = new CatLoggr();
+const { createVolumesFolder } = require('./init.js');
 
-// Initialize Docker connection
+const log    = new CatLoggr();
 const docker = new Docker({ socketPath: process.env.dockerSocket });
 
 async function seed() {
+    await createVolumesFolder();
+
+    let images;
     try {
-        createVolumesFolder();
-        log.init('retrieving image list from lunarix...');
-        const response = await axios.get(config.remote + '/images/list');
-
-        const images = response.data;
-        log.init('pulling images...');
-
-        for (const image of images) {
-            try {
-                log.info(`attempting to pull image: ${image.Image}...`);
-                await docker.pull(image.Image, (err, stream) => {
-                    if (err) {
-                        log.error(`failed to pull image ${image.Image}:`, err.message);
-                        return;
-                    }
-                    docker.modem.followProgress(stream, onFinished, onProgress);
-
-                    function onFinished(err, output) {
-                        if (err) {
-                            log.error(`error after pulling image ${image.Image}:`, err.message);
-                        } else {
-                            log.info(`successfully pulled image ${image.Image}`);
-                        }
-                    }
-
-                    function onProgress(event) {
-                        log.info(`pulling ${image.Image}: ${event.status}`);
-                    }
-                });
-            } catch (err) {
-                log.error(`error pulling image ${image.Image}:`, err.message);
-            }
-        }
+        log.init('Fetching image list from panel...');
+        const response = await axios.get(config.remote + '/images/list', { timeout: 10000 });
+        images = response.data;
     } catch (error) {
-        log.error('failed to retrieve image list from remote! the panel might be down. error:', error.message);
-        process.exit();
+        // Panel may be temporarily unavailable — log and continue rather than killing the process.
+        // The daemon can still serve existing containers without the image list.
+        log.warn('Could not fetch image list from panel: ' + error.message);
+        log.warn('Daemon will start without pre-pulling images. Retry on next restart.');
+        return;
     }
 
-    log.info('done!');
+    if (!Array.isArray(images) || images.length === 0) {
+        log.info('No images to pull.');
+        return;
+    }
+
+    log.init('Pulling ' + images.length + ' image(s)...');
+
+    for (const image of images) {
+        if (!image.Image || typeof image.Image !== 'string') continue;
+        try {
+            log.info('Pulling ' + image.Image + '...');
+            await new Promise((resolve, reject) => {
+                docker.pull(image.Image, (err, stream) => {
+                    if (err) return reject(err);
+                    docker.modem.followProgress(stream,
+                        (err) => err ? reject(err) : resolve(),
+                        (event) => { if (event.status) log.info(image.Image + ': ' + event.status); }
+                    );
+                });
+            });
+            log.info('Pulled ' + image.Image);
+        } catch (err) {
+            // A single failed pull should not abort the rest
+            log.error('Failed to pull ' + image.Image + ': ' + err.message);
+        }
+    }
+
+    log.info('Image pre-pull complete.');
 }
 
 module.exports = { seed };

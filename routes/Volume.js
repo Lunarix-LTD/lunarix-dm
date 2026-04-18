@@ -1,370 +1,269 @@
 const express = require('express');
-const router = express.Router();
-const fs = require('fs').promises;
-const multer = require('multer');
-const upload = multer({ dest: 'tmp/' });
-const path = require('path');
+const router  = express.Router();
+const fs      = require('fs').promises;
+const multer  = require('multer');
+const path    = require('path');
 
-/**
- * Ensures the target path is within the specified base directory, preventing directory traversal attacks.
- * @param {string} base - The base directory path.
- * @param {string} target - The target directory or file path.
- * @returns {string} The absolute path that is confirmed to be within the base directory.
- * @throws {Error} If the resolved path attempts to escape the base directory.
- */
-function safePath(base, target) {
-    const fullPath = path.resolve(base, target);
-    if (!fullPath.startsWith(base)) {
-        throw new Error('Attempting to access outside of the volume');
+// Temp uploads go to a dedicated tmp dir, not the OS temp, to keep them local
+const upload = multer({
+    dest: 'tmp/',
+    limits: { fileSize: 100 * 1024 * 1024 }, // 100 MB per file
+});
+
+const VOLUMES_BASE = path.resolve(__dirname, '../volumes');
+
+// Resolve and validate that target stays inside the volume root
+function safePath(volumeId, subPath, filename) {
+    if (!/^[a-zA-Z0-9\-_]+$/.test(volumeId)) {
+        throw new Error('Invalid volume ID');
     }
-    return fullPath;
+    const base     = path.join(VOLUMES_BASE, volumeId);
+    const combined = filename ? path.join(base, subPath || '', filename) : path.join(base, subPath || '');
+    const resolved = path.resolve(combined);
+    if (!resolved.startsWith(base)) {
+        throw new Error('Path traversal attempt detected');
+    }
+    return resolved;
 }
 
-/**
- * Determines the purpose of a file based on its extension.
- * @param {string} file - The file name to check.
- * @returns {string} The purpose category of the file.
- */
 function getFilePurpose(file) {
-    const extension = path.extname(file).toLowerCase();
-    const purposes = {
-        programming: ['.py', '.java', '.c', '.cpp', '.h', '.hpp', '.cs', '.go', '.rb', '.php', '.swift', '.kt', '.rs', '.scala', '.groovy'],
+    const ext = path.extname(file).toLowerCase();
+    const map = {
+        programming:    ['.py', '.java', '.c', '.cpp', '.h', '.hpp', '.cs', '.go', '.rb', '.php', '.swift', '.kt', '.rs', '.scala', '.groovy'],
         webDevelopment: ['.html', '.htm', '.css', '.scss', '.sass', '.less', '.js', '.ts', '.jsx', '.tsx', '.json', '.xml', '.svg'],
-        textDocument: ['.txt', '.md', '.rtf', '.log'],
-        configuration: ['.ini', '.yaml', '.yml', '.toml', '.cfg', '.conf', '.properties'],
-        database: ['.sql'],
-        script: ['.sh', '.bash', '.ps1', '.bat', '.cmd'],
-        document: ['.tex', '.bib', '.markdown'],
+        textDocument:   ['.txt', '.md', '.rtf', '.log'],
+        configuration:  ['.ini', '.yaml', '.yml', '.toml', '.cfg', '.conf', '.properties'],
+        database:       ['.sql'],
+        script:         ['.sh', '.bash', '.ps1', '.bat', '.cmd'],
     };
-
-    for (const [purpose, extensions] of Object.entries(purposes)) {
-        if (extensions.includes(extension)) {
-            return purpose;
-        }
+    for (const [purpose, exts] of Object.entries(map)) {
+        if (exts.includes(ext)) return purpose;
     }
     return 'other';
 }
 
-/**
- * Determines if a file is editable based on its extension.
- * @param {string} file - The file name to check.
- * @returns {boolean} True if the file's extension is in the list of editable types, false otherwise.
- */
-function isEditable(file) {
-    const editableExtensions = [
-        // Text files
-        '.txt', '.md', '.rtf', '.log', '.ini', '.csv',
-        
-        // Web development
-        '.html', '.htm', '.css', '.scss', '.sass', '.less',
-        '.js', '.ts', '.jsx', '.tsx', '.json', '.xml', '.svg',
-        
-        // Programming languages
-        '.py', '.java', '.c', '.cpp', '.h', '.hpp', '.cs', '.go',
-        '.rb', '.php', '.swift', '.kt', '.rs', '.scala', '.groovy',
-        
-        // Scripting
-        '.sh', '.bash', '.ps1', '.bat', '.cmd',
-        
-        // Markup and config
-        '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf', '.properties',
-        
-        // Document formats
-        '.tex', '.bib', '.markdown',
-        
-        // Database
-        '.sql',
-        
-        // Others
-        '.gitignore', '.env', '.htaccess'
-    ];
-    
-    return editableExtensions.includes(path.extname(file).toLowerCase());
+const EDITABLE_EXTENSIONS = new Set([
+    '.txt', '.md', '.rtf', '.log', '.ini', '.csv',
+    '.html', '.htm', '.css', '.scss', '.sass', '.less',
+    '.js', '.ts', '.jsx', '.tsx', '.json', '.xml', '.svg',
+    '.py', '.java', '.c', '.cpp', '.h', '.hpp', '.cs', '.go',
+    '.rb', '.php', '.swift', '.kt', '.rs', '.scala', '.groovy',
+    '.sh', '.bash', '.ps1', '.bat', '.cmd',
+    '.yaml', '.yml', '.toml', '.cfg', '.conf', '.properties',
+    '.tex', '.bib', '.markdown', '.sql',
+    '.gitignore', '.env', '.htaccess',
+]);
+
+function isEditable(filename) {
+    return EDITABLE_EXTENSIONS.has(path.extname(filename).toLowerCase());
 }
 
-/**
- * Formats file size into a human-readable string.
- * @param {number} bytes - The file size in bytes.
- * @returns {string} Formatted file size with appropriate unit.
- */
 function formatFileSize(bytes) {
     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let size = bytes;
-    let unitIndex = 0;
-
-    while (size >= 1024 && unitIndex < units.length - 1) {
-        size /= 1024;
-        unitIndex++;
-    }
-
-    return `${size.toFixed(2)} ${units[unitIndex]}`;
+    let size = bytes, i = 0;
+    while (size >= 1024 && i < units.length - 1) { size /= 1024; i++; }
+    return size.toFixed(2) + ' ' + units[i];
 }
 
-/**
- * GET /:id/files
- * Retrieves a list of files and directories within a specified volume, optionally within a subdirectory.
- * Provides enhanced details about each file or directory, including its type, editability, size, last updated timestamp, and purpose.
- *
- * @param {string} id - The volume identifier.
- * @param {string} [path] - Optional. A subdirectory within the volume to list files from.
- * @returns {Response} JSON response containing detailed information about files within the specified path.
- */
+// GET /fs/:id/files[?path=subdir]
 router.get('/:id/files', async (req, res) => {
-    const volumeId = req.params.id;
+    const { id } = req.params;
     const subPath = req.query.path || '';
-    const volumePath = path.join(__dirname, '../volumes', volumeId);
-
-    if (!volumeId) return res.status(400).json({ message: 'No volume ID' });
+    if (!id) return res.status(400).json({ message: 'No volume ID' });
 
     try {
-        const fullPath = safePath(volumePath, subPath);
-        const files = await fs.readdir(fullPath, { withFileTypes: true });
-        
-        const detailedFiles = await Promise.all(files.map(async (file) => {
-            const filePath = path.join(fullPath, file.name);
-            const stats = await fs.stat(filePath);
-            
+        const fullPath = safePath(id, subPath);
+        const entries  = await fs.readdir(fullPath, { withFileTypes: true });
+
+        const files = await Promise.all(entries.map(async (entry) => {
+            const filePath = path.join(fullPath, entry.name);
+            const stats    = await fs.stat(filePath);
             return {
-                name: file.name,
-                isDirectory: file.isDirectory(),
-                isEditable: isEditable(file.name),
-                size: formatFileSize(stats.size),
+                name:        entry.name,
+                isDirectory: entry.isDirectory(),
+                isEditable:  isEditable(entry.name),
+                size:        formatFileSize(stats.size),
                 lastUpdated: stats.mtime.toISOString(),
-                purpose: file.isDirectory() ? 'folder' : getFilePurpose(file.name),
-                extension: path.extname(file.name).toLowerCase(),
-                permissions: stats.mode.toString(8).slice(-3) // Unix-style permissions
+                purpose:     entry.isDirectory() ? 'folder' : getFilePurpose(entry.name),
+                extension:   path.extname(entry.name).toLowerCase(),
+                permissions: stats.mode.toString(8).slice(-3),
             };
         }));
-        
-        res.json({ files: detailedFiles });
+
+        res.json({ files });
     } catch (err) {
-        if (err.message.includes('Attempting to access outside of the volume')) {
-            res.status(400).json({ message: err.message });
-        } else {
-            res.status(500).json({ message: err.message });
+        if (err.message.includes('traversal') || err.message.includes('Invalid')) {
+            return res.status(400).json({ message: err.message });
         }
+        res.status(500).json({ message: err.message });
     }
 });
 
-/**
- * POST /:id/files/rename/:filename/:newfilename
- * Renames a specific file within a volume. Validates the file paths to ensure they are within the designated volume directory.
- *
- * @param {string} id - The volume identifier.
- * @param {string} filename - The current name of the file to rename.
- * @param {string} newfilename - The new name for the file.
- * @param {string} [path] - Optional query parameter. A subdirectory within the volume where the file is located.
- * @returns {Response} JSON response indicating the result of the rename operation.
- */
+// POST /fs/:id/files/rename/:filename/:newfilename[?path=subdir]
 router.post('/:id/files/rename/:filename/:newfilename', async (req, res) => {
     const { id, filename, newfilename } = req.params;
-    const volumePath = path.join(__dirname, '../volumes', id);
     const subPath = req.query.path || '';
 
     try {
-        const oldPath = safePath(path.join(volumePath, subPath), filename);
-        const newPath = safePath(path.join(volumePath, subPath), newfilename);
+        const oldPath = safePath(id, subPath, filename);
+        const newPath = safePath(id, subPath, newfilename);
 
-        // Check if the new filename already exists
         try {
             await fs.access(newPath);
-            return res.status(400).json({ message: 'A file with the new name already exists' });
-        } catch (err) {
-            // If fs.access throws an error, it means the file doesn't exist, which is what we want
-            if (err.code !== 'ENOENT') {
-                throw err;
-            }
+            return res.status(400).json({ message: 'A file with that name already exists' });
+        } catch (e) {
+            if (e.code !== 'ENOENT') throw e;
         }
 
         await fs.rename(oldPath, newPath);
-        res.json({ message: 'File renamed successfully' });
+        res.json({ message: 'File renamed' });
     } catch (err) {
-        if (err.code === 'ENOENT') {
-            res.status(404).json({ message: 'File not found' });
-        } else {
-            res.status(500).json({ message: err.message });
+        if (err.code === 'ENOENT') return res.status(404).json({ message: 'File not found' });
+        if (err.message.includes('traversal') || err.message.includes('Invalid')) {
+            return res.status(400).json({ message: err.message });
         }
+        res.status(500).json({ message: err.message });
     }
 });
 
-/**
- * GET /:id/files/view
- * Retrieves the content of a specific file within a volume, provided the file type is supported for viewing.
- * This endpoint checks if the file is editable to determine if its content can be viewed.
- *
- * @param {string} id - The volume identifier.
- * @param {string} filename - The name of the file to view.
- * @returns {Response} JSON response containing the content of the file if viewable, or an error message.
- */
+// GET /fs/:id/files/view/:filename[?path=subdir]
 router.get('/:id/files/view/:filename', async (req, res) => {
     const { id, filename } = req.params;
-    const volumePath = path.join(__dirname, '../volumes', id);
+    const subPath = req.query.path || '';
 
-    if (!id || !filename) return res.status(400).json({ message: 'No volume ID' });
-    
-    const dirPath = req.query.path;
-    
-    let formattedPath;
-    if (dirPath) {
-        formattedPath = dirPath + '/' + filename
-    } else {
-        formattedPath = filename
-    }
+    if (!id || !filename) return res.status(400).json({ message: 'Missing parameters' });
 
     try {
-        const filePath = safePath(volumePath, formattedPath);
-        if (!isEditable(filePath)) {
+        const filePath = safePath(id, subPath, filename);
+
+        if (!isEditable(filename)) {
             return res.status(400).json({ message: 'File type not supported for viewing' });
         }
+
+        const stats = await fs.stat(filePath);
+        // Refuse to read files larger than 5 MB into memory
+        if (stats.size > 5 * 1024 * 1024) {
+            return res.status(413).json({ message: 'File too large to view (max 5 MB)' });
+        }
+
         const content = await fs.readFile(filePath, 'utf8');
         res.json({ content });
     } catch (err) {
+        if (err.code === 'ENOENT') return res.status(404).json({ message: 'File not found' });
+        if (err.message.includes('traversal') || err.message.includes('Invalid')) {
+            return res.status(400).json({ message: err.message });
+        }
         res.status(500).json({ message: err.message });
     }
 });
 
-/**
- * POST /:id/files/upload
- * Uploads one or more files to a specified volume, optionally within a subdirectory.
- * 
- * @param {string} id - The volume identifier.
- * @param {string} [path] - Optional. A subdirectory within the volume where files should be stored.
- */
+// POST /fs/:id/files/upload[?path=subdir]
 router.post('/:id/files/upload', upload.array('files'), async (req, res) => {
     const { id } = req.params;
-    const volumePath = path.join(__dirname, '../volumes', id);
     const subPath = req.query.path || '';
 
     try {
-        const fullPath = safePath(volumePath, subPath);
+        const fullPath = safePath(id, subPath);
 
-        await Promise.all(req.files.map(file => {
-            const destPath = path.join(fullPath, file.originalname);
+        await Promise.all(req.files.map(async (file) => {
+            const destPath = path.join(fullPath, path.basename(file.originalname));
+            // Ensure dest is still inside volume after basename resolution
+            if (!destPath.startsWith(path.join(VOLUMES_BASE, id))) {
+                await fs.unlink(file.path).catch(() => {});
+                throw new Error('Invalid upload destination');
+            }
             return fs.rename(file.path, destPath);
         }));
 
-        res.json({ message: 'Files uploaded successfully' });
+        res.json({ message: 'Files uploaded' });
     } catch (err) {
-        req.files.forEach(file => fs.unlink(file.path)); // Cleanup any saved files in case of failure
+        // Clean up any temp files on failure
+        if (req.files) {
+            await Promise.allSettled(req.files.map(f => fs.unlink(f.path)));
+        }
+        if (err.message.includes('traversal') || err.message.includes('Invalid')) {
+            return res.status(400).json({ message: err.message });
+        }
         res.status(500).json({ message: err.message });
     }
 });
 
-/**
- * POST /:id/files/edit
- * Modifies the content of a specific file within a volume. The file must be of a type that is editable.
- * Receives the new content in the request body and overwrites the file with this content.
- *
- * @param {string} id - The volume identifier.
- * @param {string} filename - The name of the file to edit.
- * @param {string} content - The new content to write to the file.
- * @returns {Response} JSON response indicating the result of the file update operation.
- */
+// POST /fs/:id/files/edit/:filename[?path=subdir]
 router.post('/:id/files/edit/:filename', async (req, res) => {
     const { id, filename } = req.params;
-    const { content } = req.body;
-    const volumePath = path.join(__dirname, '../volumes', id);
+    const { content }      = req.body;
+    const subPath          = req.query.path || '';
 
-    const dirPath = req.query.path;
-    
-    let formattedPath;
-    if (dirPath) {
-        formattedPath = dirPath + '/' + filename
-    } else {
-        formattedPath = filename
-    }
-    
     try {
-        const filePath = safePath(volumePath, formattedPath);
-        if (!isEditable(filePath)) {
+        const filePath = safePath(id, subPath, filename);
+
+        if (!isEditable(filename)) {
             return res.status(400).json({ message: 'File type not supported for editing' });
         }
-        await fs.writeFile(filePath, content);
-        res.json({ message: 'File updated successfully' });
+        if (typeof content !== 'string') {
+            return res.status(400).json({ message: 'Content must be a string' });
+        }
+        // Limit write size to 5 MB
+        if (Buffer.byteLength(content, 'utf8') > 5 * 1024 * 1024) {
+            return res.status(413).json({ message: 'Content too large (max 5 MB)' });
+        }
+
+        await fs.writeFile(filePath, content, 'utf8');
+        res.json({ message: 'File updated' });
     } catch (err) {
+        if (err.code === 'ENOENT') return res.status(404).json({ message: 'File not found' });
+        if (err.message.includes('traversal') || err.message.includes('Invalid')) {
+            return res.status(400).json({ message: err.message });
+        }
         res.status(500).json({ message: err.message });
     }
 });
 
-/**
- * POST /:id/files/create
- * Creates a file with the specified filename and content within a volume, optionally within a subdirectory.
- * The path to the subdirectory can be provided via a query parameter.
- * 
- * @param {string} id - The volume identifier.
- * @param {string} filename - The name of the file to create.
- * @param {string} content - The content to write to the file.
- * @returns {Response} JSON response indicating the result of the file creation operation.
- */
+// POST /fs/:id/files/create/:filename[?path=subdir]
 router.post('/:id/files/create/:filename', async (req, res) => {
     const { id, filename } = req.params;
-    const { content } = req.body;
-    const volumePath = path.join(__dirname, '../volumes', id);
-    const subPath = req.query.path || ''; // Use query parameter to get the subpath
+    const { content }      = req.body;
+    const subPath          = req.query.path || '';
 
     try {
-        // Ensure the path is safe and resolve it to an absolute path
-        const fullPath = safePath(path.join(volumePath, subPath), filename);
-
-        // Write the content to the new file
-        await fs.writeFile(fullPath, content);
-        res.json({ message: 'File created successfully' });
+        const filePath = safePath(id, subPath, filename);
+        await fs.writeFile(filePath, content || '', 'utf8');
+        res.json({ message: 'File created' });
     } catch (err) {
-        if (err.code === 'ENOENT') {
-            res.status(404).json({ message: 'Specified path not found' });
-        } else {
-            res.status(500).json({ message: err.message });
+        if (err.code === 'ENOENT') return res.status(404).json({ message: 'Path not found' });
+        if (err.message.includes('traversal') || err.message.includes('Invalid')) {
+            return res.status(400).json({ message: err.message });
         }
+        res.status(500).json({ message: err.message });
     }
 });
 
-/**
- * POST /:id/folders/create
- * Creates a folder within a specified volume, optionally within a subdirectory.
- * The path to the subdirectory can be provided via a query parameter.
- * 
- * @param {string} id - The volume identifier.
- * @param {string} foldername - The name of the folder to create.
- * @returns {Response} JSON response indicating the result of the folder creation operation.
- */
+// POST /fs/:id/folders/create/:foldername[?path=subdir]
 router.post('/:id/folders/create/:foldername', async (req, res) => {
     const { id, foldername } = req.params;
-    const volumePath = path.join(__dirname, '../volumes', id);
-    const subPath = req.query.path || '';
+    const subPath            = req.query.path || '';
 
     try {
-        // Ensure the path is safe and resolve it to an absolute path
-        const fullPath = safePath(volumePath, subPath);
-        const targetFolderPath = path.join(fullPath, foldername);
-
-        // Create the folder
-        await fs.mkdir(targetFolderPath, { recursive: true });
-        res.json({ message: 'Folder created successfully' });
+        const folderPath = safePath(id, subPath, foldername);
+        await fs.mkdir(folderPath, { recursive: false });
+        res.json({ message: 'Folder created' });
     } catch (err) {
-        if (err.code === 'EEXIST') {
-            res.status(400).json({ message: 'Folder already exists' });
-        } else {
-            res.status(500).json({ message: err.message });
+        if (err.code === 'EEXIST') return res.status(400).json({ message: 'Folder already exists' });
+        if (err.message.includes('traversal') || err.message.includes('Invalid')) {
+            return res.status(400).json({ message: err.message });
         }
+        res.status(500).json({ message: err.message });
     }
 });
 
-/**
- * DELETE /:id/files/delete
- * Deletes a specific file within a volume. Validates the file path to ensure it is within the designated volume directory.
- *
- * @param {string} id - The volume identifier.
- * @param {string} filename - The name of the file to delete.
- * @returns {Response} JSON response indicating the result of the delete operation.
- */
+// DELETE /fs/:id/files/delete/:filename[?path=subdir]
 router.delete('/:id/files/delete/:filename', async (req, res) => {
     const { id, filename } = req.params;
-    const volumePath = path.join(__dirname, '../volumes', id);
-    const subPath = req.query.path || '';
+    const subPath          = req.query.path || '';
 
     try {
-        const filePath = safePath(path.join(volumePath, subPath), filename);
-        const stats = await fs.lstat(filePath);
+        const filePath = safePath(id, subPath, filename);
+        const stats    = await fs.lstat(filePath);
 
         if (stats.isDirectory()) {
             await fs.rm(filePath, { recursive: true, force: true });
@@ -372,8 +271,12 @@ router.delete('/:id/files/delete/:filename', async (req, res) => {
             await fs.unlink(filePath);
         }
 
-        res.json({ message: 'File deleted successfully' });
+        res.json({ message: 'Deleted' });
     } catch (err) {
+        if (err.code === 'ENOENT') return res.status(404).json({ message: 'Not found' });
+        if (err.message.includes('traversal') || err.message.includes('Invalid')) {
+            return res.status(400).json({ message: err.message });
+        }
         res.status(500).json({ message: err.message });
     }
 });
